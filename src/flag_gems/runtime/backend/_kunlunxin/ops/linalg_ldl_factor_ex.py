@@ -47,6 +47,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
@@ -271,6 +272,68 @@ def _check_linalg_ldl_factor_ex(A, hermitian, check_errors):
         )
 
 
+# ---- tle.raw payload: whole factorization in one launch, matrix resident in LM --
+#
+# The step kernel above runs one launch per Bunch-Kaufman step (libentry: ~19us
+# each) and each step re-reads the workspace through a flat tile, where the row
+# and column views are separate DMAs.  A payload can keep the whole n x n matrix
+# in LM (n <= 32 -> 4 KB), so the row/column views are plain indexing and the
+# entire DSYTF2 loop runs in ONE launch.
+#
+# Measured on card 3 (batch=1, fp32; torch is ~190-212us for every n because it
+# is host-looped too): n=4 11.6us, n=8 22us, n=16 66us, n=32 292us.
+_LDL_MAX_N = 32
+_LDL_GRID = 12  # physical clusters
+_LDL_PAYLOAD = {"init": False, "ok": False, "kern": None, "meta": {}}
+
+
+def _ldl_payload_init():
+    if _LDL_PAYLOAD["init"]:
+        return _LDL_PAYLOAD["ok"]
+    _LDL_PAYLOAD["init"] = True
+    try:
+        import os
+
+        import triton as _triton
+        import triton.experimental.tle as _tle
+
+        obj = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "payload",
+            "obj",
+            "ldl_factor.o",
+        )
+        ns = {"_tle": _tle, "_OBJ": obj}
+        exec(
+            "@_tle.raw.dialect('xpu3', object=_OBJ, arch=3)\n"
+            "def ldl_32(meta, a, ld, piv, info):\n"
+            "    ...\n",
+            ns,
+        )
+        callee = ns["ldl_32"]
+
+        @_triton.jit
+        def _k(M, A, LD, PIV, INFO):
+            _tle.raw.call(callee, (M, A, LD, PIV, INFO))
+
+        _LDL_PAYLOAD["kern"] = _k
+        _LDL_PAYLOAD["ok"] = True
+    except Exception as _e:  # pragma: no cover - keep backend importable
+        logger.debug("GEMS_KUNLUNXIN LDL payload init failed: %r", _e)
+        _LDL_PAYLOAD["ok"] = False
+    return _LDL_PAYLOAD["ok"]
+
+
+def _ldl_payload_meta(batch_count, n, device):
+    """Cached [batch, n] int32 meta tensor (one host->device copy per shape)."""
+    key = (batch_count, n, str(device))
+    t = _LDL_PAYLOAD["meta"].get(key)
+    if t is None:
+        t = torch.tensor([batch_count, n], dtype=torch.int32, device=device)
+        _LDL_PAYLOAD["meta"][key] = t
+    return t
+
+
 def ldl_factor_ex(A, hermitian=False, check_errors=False):
     logger.debug("GEMS_KUNLUNXIN LINALG_LDL_FACTOR_EX")
     _check_linalg_ldl_factor_ex(A, hermitian, check_errors)
@@ -278,6 +341,31 @@ def ldl_factor_ex(A, hermitian=False, check_errors=False):
         A = A.transpose(-2, -1).conj()
     n = A.shape[-1]
     batch_count = A.numel() // (n * n)
+    if (
+        n <= _LDL_MAX_N
+        and A.dtype == torch.float32
+        and A.is_contiguous()
+        and _ldl_payload_init()
+    ):
+        # One launch for the whole factorization; no padded workspace, no host
+        # step loop.  LD/pivots/info are written in place by the payload.
+        LD = torch.empty((batch_count, n, n), dtype=torch.float32, device=A.device)
+        pivots = torch.empty(batch_count, n, dtype=torch.int32, device=A.device)
+        info = torch.empty(batch_count, dtype=torch.int32, device=A.device)
+        with torch_device_fn.device(A.device):
+            _LDL_PAYLOAD["kern"][(_LDL_GRID,)](
+                _ldl_payload_meta(batch_count, n, A.device),
+                A.reshape(-1),
+                LD.reshape(-1),
+                pivots.reshape(-1),
+                info,
+            )
+        return (
+            LD.reshape(A.shape),
+            pivots.reshape(A.shape[:-1]),
+            info.reshape(A.shape[:-2]),
+        )
+
     input_contiguous = A.contiguous().reshape(batch_count, n, n)
     work_input = input_contiguous.to(torch.float32)
     lda, tot = _plan(n)
