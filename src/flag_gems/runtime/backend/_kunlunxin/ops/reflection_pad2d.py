@@ -14,6 +14,7 @@
 
 import logging
 import math
+import os
 
 import torch
 import triton
@@ -273,6 +274,96 @@ def reflection_pad2d_edge_kernel(
     tl.store(tmp_ptr + o, vals, mask=mask)
 
 
+# ---- tle.raw payload: one output row = one bulk read + one bulk write -------
+#
+# Every output row of reflection_pad2d is a reflected input row plus at most a
+# few reflected columns on each side.  The payload therefore walks output rows
+# (one row per iteration, rows striped over all cores):
+#   GM2LM(input row -> LM at column pad_left)   # contiguous bulk DMA
+#   fill the pad_left / pad_right columns in LM (plain LM writes)
+#   LM2GM(LM row -> output row)                 # contiguous bulk DMA
+# so both GM streams are contiguous and the reflected columns cost nothing.
+#
+# Why this beats both existing paths: the flat kernel's reflected load is a
+# data-dependent index, which Triton lowers to a per-element DMA (~0.13
+# ns/element -> 9.7 ms on 70M outputs).  Per-row Triton copies (the split path)
+# are slower still: one program per row with a 128/256-element block measured
+# 3.4-18 ms, ~10-20x worse than issuing the same copy as one DMA.  The payload
+# keeps the DMA path at ~420 GB/s, which is this part's DMA ceiling.
+_RP_PAYLOAD_MIN_ELEMS = 500_000
+_RP_PAYLOAD_GRID = 12  # physical clusters
+_RP_PAYLOAD = {"init": False, "ok": False, "kern": {}}
+
+
+def _rp_payload_init():
+    if _RP_PAYLOAD["init"]:
+        return _RP_PAYLOAD["ok"]
+    _RP_PAYLOAD["init"] = True
+    try:
+        import triton as _triton
+        import triton.experimental.tle as _tle
+
+        obj = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "payload",
+            "obj",
+            "reflection_pad2d.o",
+        )
+        # C signature: (int* meta, T* in, T* out), meta =
+        # [nc_total, h_in, w_in, h_out, w_out, pad_top, pad_left].
+        for sym in ("reflection_pad2d_16", "reflection_pad2d_32"):
+            ns = {"_tle": _tle, "_OBJ": obj}
+            exec(
+                "@_tle.raw.dialect('xpu3', object=_OBJ, arch=3)\n"
+                f"def {sym}(meta, x, out):\n"
+                "    ...\n",
+                ns,
+            )
+            callee = ns[sym]
+
+            def _mk(callee=callee):
+                @_triton.jit
+                def _k(M, X, O):
+                    _tle.raw.call(callee, (M, X, O))
+
+                return _k
+
+            _RP_PAYLOAD["kern"][sym] = _mk()
+        _RP_PAYLOAD["ok"] = True
+    except Exception as _e:  # pragma: no cover - keep backend importable
+        logger.debug("GEMS_KUNLUNXIN REFLECTION_PAD2D payload init failed: %r", _e)
+        _RP_PAYLOAD["ok"] = False
+    return _RP_PAYLOAD["ok"]
+
+
+def _rp_payload_launch(x, out, B, H_in, W_in, H_out, W_out, pad_left, pad_top):
+    """True when the payload handled the op; False -> use the Triton paths."""
+    if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return False
+    # __local__ row-buffer sizes baked into the packed payload (WMAX).
+    if W_out > (1024 if x.dtype == torch.float32 else 2048):
+        return False
+    rows = B * H_out
+    if rows <= 0 or rows >= 2**31 or rows * W_out >= 2**31:
+        return False
+    if not _rp_payload_init():
+        return False
+    meta = torch.tensor(
+        [B, H_in, W_in, H_out, W_out, pad_top, pad_left],
+        dtype=torch.int32,
+        device=x.device,
+    )
+    if x.dtype == torch.float32:
+        kern = _RP_PAYLOAD["kern"]["reflection_pad2d_32"]
+        xi, oi = x, out
+    else:
+        kern = _RP_PAYLOAD["kern"]["reflection_pad2d_16"]
+        xi, oi = x.view(torch.int16), out.view(torch.int16)
+    with torch_device_fn.device(x.device):
+        kern[(_RP_PAYLOAD_GRID,)](meta, xi.view(-1), oi.view(-1))
+    return True
+
+
 def launch_reflection_pad2d(input: torch.Tensor, padding, out: torch.Tensor = None):
     # Validate padding format
     if not isinstance(padding, (list, tuple)):
@@ -347,6 +438,20 @@ def launch_reflection_pad2d(input: torch.Tensor, padding, out: torch.Tensor = No
     HW_out = H_out * W_out
     HW_in = H_in * W_in
     total_out = B * HW_out
+
+    # tle.raw payload above ~500K output elements: one output row is ONE
+    # contiguous read + ONE contiguous write (bulk DMA), with the reflected
+    # columns filled in LM.  The flat kernel pays a discrete gather (~0.13
+    # ns/element) on EVERY element and the split path's per-row Triton copies
+    # measure ~10x worse than the same copy issued as DMA (see
+    # /workspace/test/reflection_payload).  Measured on card 3:
+    #   [16,32,64,128] 6048us -> 190us, [32,64,128,256] 31399us -> 1419us,
+    #   [8,16,64,64] 102us -> 17us (payload is NOT used below the threshold:
+    #   the flat kernel is already at the launch floor and beats it there).
+    if total_out >= _RP_PAYLOAD_MIN_ELEMS and _rp_payload_launch(
+        x, out, B, H_in, W_in, H_out, W_out, pad_left, pad_top
+    ):
+        return out
 
     # Split path for large outputs: the interior is a pure strided copy served
     # by the dedicated `_row_copy` kernel (provably stride-1 inner axis on both
