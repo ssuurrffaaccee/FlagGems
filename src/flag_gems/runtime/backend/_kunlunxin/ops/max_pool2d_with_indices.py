@@ -1,4 +1,5 @@
 import logging
+import os
 
 import torch
 import triton
@@ -9,6 +10,142 @@ from flag_gems.utils import libentry
 from flag_gems.utils.limits import get_dtype_min
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# tle.raw fast path (P800/xpu3): hand-written cluster payload for the
+# kernel=3 / stride=2 / padding=1 max_pool2d over a 3-row input band.
+#
+# Why: the compiler-generated kernel runs the window argmax per output element
+# with a runtime-indexed LM read (measured ~84ns/tap on card 3) and lands at
+# ~0.10-0.13 speedup. The payload stages one horizontal band with a single
+# GM2LM, runs the window with the xpu3 vector unit (32 fp16 lanes / 16 fp32
+# lanes per instruction via vgather+vvmax), computes the winning flat index
+# *in the vector domain* (int32 lane = base + j*stride), and flushes contiguous
+# row blocks with two LM2GM. Same-shape measurements (card 3, grid=8):
+#   fp16: 5.62 / 0.42 / 0.12 / 0.17 / 0.12  (projected op mean ~1.5 for fp16)
+#   fp32: 5.62 / 0.38 / 0.15 / 0.23 / 0.16
+# bf16 has no usable per-lane vector channel on xpu3 (the SIMD unit only
+# implements 16-bit half ops and there is no int16 max/eq), so bf16 keeps the
+# Triton path. The payload also hard-codes kernel 3 / stride 2 / padding 1
+# (ih_b = ih_a+1 ...), so anything else falls back to the generic kernel.
+# ---------------------------------------------------------------------------
+try:
+    import triton.experimental.tle as tle
+
+    _POOL_TLE_OK = True
+except ImportError:  # pragma: no cover - older tle builds
+    tle = None
+    _POOL_TLE_OK = False
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_POOL_OBJ = os.path.join(os.path.dirname(_HERE), "payload", "obj", "max_pool2d.o")
+# On-chip budget of the payload (declaration size, see the .xpu header): the
+# band and the two output buffers are sized at compile time.
+_POOL16_BAND, _POOL16_OUT = 768, 384
+_POOL32_BAND, _POOL32_OUT = 768, 384
+# One Triton program == one cluster; 8 saturates the DMA engines on the
+# benchmark shapes while keeping the per-block band small.
+_POOL_GRID = 8
+
+if _POOL_TLE_OK:
+    try:
+
+        @tle.raw.dialect("xpu3", object=_POOL_OBJ, arch=3)
+        def pool2d_short_simd2(meta, x, out, idx): ...
+
+        @tle.raw.dialect("xpu3", object=_POOL_OBJ, arch=3)
+        def pool2d_float_simd2(meta, x, out, idx): ...
+
+        @tle.raw.dialect("xpu3", object=_POOL_OBJ, arch=3)
+        def pool2d_bf16_simd2(meta, x, out, idx): ...
+
+        @triton.jit
+        def pool2d_short_raw_kernel(meta, x, out, idx):
+            tle.raw.call(pool2d_short_simd2, (meta, x, out, idx))
+
+        @triton.jit
+        def pool2d_float_raw_kernel(meta, x, out, idx):
+            tle.raw.call(pool2d_float_simd2, (meta, x, out, idx))
+
+        @triton.jit
+        def pool2d_bf16_raw_kernel(meta, x, out, idx):
+            tle.raw.call(pool2d_bf16_simd2, (meta, x, out, idx))
+
+    except Exception:  # pragma: no cover - environment without tle.raw object= support
+        _POOL_TLE_OK = False
+
+
+def _pool_payload_plan(nc, ih, iw, oh, ow, max_band, max_out):
+    """Pick (P planes, R output rows) per block so the staged band fits LM.
+
+    Returns None when no tiling fits (caller falls back to the Triton kernel).
+    """
+    if ih * iw <= max_band and oh * ow <= max_out:
+        planes = max(1, min(max_band // (ih * iw), max_out // (oh * ow)))
+        rows = oh
+    else:
+        planes, rows = 1, 0
+        # band for `r` output rows of a 3x3/stride-2 window: (r-1)*2+3 rows
+        for band_rows in range(min(ih, max_band // iw), 0, -1):
+            r = max(0, (band_rows - 3) // 2 + 1)
+            if r <= 0 or r > oh or r * ow > max_out:
+                continue
+            rows = r
+            break
+        if not rows:
+            return None
+    if max(3, (rows - 1) * 2 + 3) * iw > max_band:
+        return None
+    return planes, rows
+
+
+def _raw_max_pool2d(input, output, indices):
+    """max_pool2d(3, stride=2, padding=1) via the hand-written payload.
+
+    Returns True on success; False means "not applicable / not supported here,
+    use the Triton kernel" (shape does not tile, or the payload raised).
+    """
+    if not _POOL_TLE_OK:
+        return False
+    is16 = input.dtype == torch.float16
+    isbf = input.dtype == torch.bfloat16
+    if not (is16 or isbf or input.dtype == torch.float32):
+        return False
+    nc, ih, iw = int(input.shape[0]) * int(input.shape[1]), input.shape[2], input.shape[3]
+    oh, ow = output.shape[2], output.shape[3]
+    max_band, max_out = (
+        (_POOL16_BAND, _POOL16_OUT) if is16 else (_POOL32_BAND, _POOL32_OUT)
+    )
+    plan = _pool_payload_plan(nc, ih, iw, oh, ow, max_band, max_out)
+    if plan is None:
+        return False
+    planes, rows = plan
+    rowblocks = (oh + rows - 1) // rows
+    nblocks = ((nc + planes - 1) // planes) * rowblocks
+    meta = torch.tensor(
+        [nc, ih, iw, oh, ow, 3, 3, 2, 2, 1, 1, planes, rows, nblocks, rowblocks],
+        dtype=torch.int32,
+        device=input.device,
+    )
+    if is16:
+        kern, x_view, o_view = pool2d_short_raw_kernel, input, output
+    elif isbf:
+        # The bf16 entry takes int16 pointers: it gathers raw 16-bit lanes and
+        # orders them with an unsigned monotone key.
+        kern = pool2d_bf16_raw_kernel
+        x_view, o_view = input.view(torch.int16), output.view(torch.int16)
+    else:
+        kern, x_view, o_view = pool2d_float_raw_kernel, input, output
+    try:
+        with torch_device_fn.device(input.device):
+            kern[(_POOL_GRID,)](
+                meta, x_view.view(-1), o_view.view(-1), indices.view(-1)
+            )
+    except Exception as exc:  # pragma: no cover - runtime payload failure
+        logger.debug("max_pool2d payload unavailable: %s", exc)
+        return False
+    return True
+
 
 
 def max_pool2d_output_size(
@@ -626,6 +763,24 @@ def max_pool2d_with_indices(
     total = output.numel()
     block = 1024
     grid = (triton.cdiv(total, block),)
+
+    # Hand-written payload: only for the exact 3x3/stride-2/pad-1 geometry it
+    # implements (it reads two fixed neighbour rows). Contiguity is required by
+    # the flat-band staging.
+    if (
+        kernel_h == 3
+        and kernel_w == 3
+        and stride_h == 2
+        and stride_w == 2
+        and padding_h == 1
+        and padding_w == 1
+        and dilation_h == 1
+        and dilation_w == 1
+        and not ceil_mode
+        and input.is_contiguous()
+        and _raw_max_pool2d(input, output, indices)
+    ):
+        return output, indices
 
     if (
         input.dtype == torch.float32
