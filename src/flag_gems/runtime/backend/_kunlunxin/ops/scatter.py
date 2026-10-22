@@ -392,6 +392,11 @@ _scatter_func = ScatterFunction()
 # Built lazily to keep backend import side-effect free.  Shapes/dtypes/layouts
 # outside the fast path defer to the codegen kernel (dispatch, not fallback).
 _TLE_NDM = 4  # max leading dims (ndim - 1); covers ndim <= 5
+# All physical clusters.  The payload's row loop only covers the rows that its
+# own cluster/core ids reach, so the launch geometry must match the part:
+# grid=1 measures ~1-8% faster on every benchmark shape (it is DMA/NOC bound)
+# but silently leaves rows unwritten -- tests/test_scatter.py -k scatter_src
+# fails 16/72 cases at dim=2 with grid=1, and passes 72/72 at grid=8.
 _TLE_GRID = 8  # physical clusters on this part
 # (elt, index C type, WT, KT, simd).  LM budget is ~6-7 KB, so the wider int64
 # index halves KT.
@@ -622,6 +627,149 @@ def _tle_scatter_src(inp, dim, index, src):
         return None
 
 
+# ---- tle.raw row-resident SM scatter for wide innermost dims ------------------
+#
+# The LM-staging path above writes each scrambled element with its own 2-byte
+# LM2GM DMA (OffsetState::Unknown), so a wide row costs ~0.8-1.0 ns/element:
+# [1024, 65536] fp32 takes ~46 ms against torch's ~2.4 ms.
+#
+# This payload instead keeps the whole output row in the cluster's shared memory
+# (`__shared__`, 256 KB per cluster = up to 65536 fp32 / 131072 16-bit elements):
+#   GM2SM the row (contiguous bulk DMA, ~420 GB/s measured)
+#   -> each core of the cluster scatters its slice of j into SM (plain shared
+#      memory stores, no DMA at all)
+#   -> sync_cluster
+#   -> SM2GM the row back (bulk DMA).
+# One cluster owns one row at a time, so the cluster's 64 cores cooperate and
+# the row is staged once.  Measured on card 3: [1024, 65536] fp32 45.8 ms ->
+# 1.57 ms (torch 2.47 ms), fp16/bf16 65.2 ms -> 1.37 ms (torch 3.07 ms).
+#
+# Semantics: within a core's j slice the writes are applied in increasing j, so
+# duplicate indices resolve to "last writer wins" exactly like ATen's CPU loop.
+# Across slices (different cores) duplicates are unordered -- the same caveat
+# GPU scatter has always had.  tests/test_scatter.py builds unique indices
+# (randperm), so it is bit-exact there.
+#
+# Only wide rows take this path: below the thresholds the three cluster barriers
+# per row dominate ([1024, 1024] 170 us vs 28 us on the LM path).  16-bit rows
+# carry half the bytes, so [4096, 4096] is already a win there (0.61 -> 0.90).
+_ROW_MIN_W_16 = 4096
+_ROW_MIN_W_32 = 8192
+_ROW_GRID = 12  # physical clusters; the row loop covers every row for any grid
+_ROW = {"init": False, "ok": False, "kern": {}}
+
+
+def _row_scatter_init():
+    if _ROW["init"]:
+        return _ROW["ok"]
+    _ROW["init"] = True
+    try:
+        import triton as _triton
+        import triton.experimental.tle as _tle
+
+        obj = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "payload",
+            "obj",
+            "scatter_row.o",
+        )
+        # Merge of the two packed payloads (scatter_row_32b / scatter_row_16b)
+        # with `ld.lld -r`; stub name == entry symbol, C++ signature is
+        # (int* meta, long long* idx, T* src, T* base, T* out).
+        for sym in ("scatter_row_16b", "scatter_row_32b"):
+            ns = {"_tle": _tle, "_OBJ": obj}
+            exec(
+                "@_tle.raw.dialect('xpu3', object=_OBJ, arch=3)\n"
+                f"def {sym}(meta, idx, src, base, out):\n"
+                "    ...\n",
+                ns,
+            )
+            callee = ns[sym]
+
+            def _mk(callee=callee):
+                @_triton.jit
+                def _k(M, I, S, B, O):
+                    _tle.raw.call(callee, (M, I, S, B, O))
+
+                return _k
+
+            _ROW["kern"][sym] = _mk()
+        _ROW["ok"] = True
+    except Exception as _e:  # pragma: no cover - keep backend importable
+        logger.debug("GEMS_KUNLUNXIN SCATTER row payload init failed: %r", _e)
+        _ROW["ok"] = False
+    return _ROW["ok"]
+
+
+def _row_scatter_src(inp, dim, index, src, out=None):
+    """Wide-row innermost-dim scatter via the row-resident SM payload.
+
+    Returns the written tensor, or None to defer to the other paths.  `out` may
+    be `inp` itself (in-place); the payload loads each row from `base = inp`
+    before scattering, so the aliasing is safe.  `out=None` allocates.
+    """
+    try:
+        if dim != inp.ndim - 1:
+            return None
+        # Cheapest possible bail-out first: the row path only pays off on wide
+        # rows (three cluster barriers per row), and this is on the hot path of
+        # every small scatter call.  16-bit rows are half the bytes, so the
+        # overlap with the LM path's degenerate case starts one step earlier.
+        W = inp.size(-1)
+        if inp.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            return None
+        if W < (_ROW_MIN_W_32 if inp.dtype == torch.float32 else _ROW_MIN_W_16):
+            return None
+        if index.dtype != torch.int64 or src.dtype != inp.dtype:
+            return None
+        if tuple(index.shape) != tuple(src.shape):
+            return None
+        if tuple(index.shape[:-1]) != tuple(inp.shape[:-1]):
+            return None
+        if not (inp.is_contiguous() and index.is_contiguous() and src.is_contiguous()):
+            return None
+        K = index.size(-1)
+        if K <= 0 or K > W:
+            return None
+        # __shared__ buffer sizes baked into the packed payloads.
+        if W > (65536 if inp.dtype == torch.float32 else 131072):
+            return None
+        if inp.numel() >= 2**31 or index.numel() >= 2**31:
+            return None
+        R = index.numel() // K
+        if R <= 0:
+            return None
+        if not _row_scatter_init():
+            return None
+
+        if out is None:
+            out = torch.empty_like(inp)
+        elif out is not inp:
+            return None
+        if not out.is_contiguous():
+            return None
+
+        meta = torch.tensor([R, W, K], dtype=torch.int32, device=inp.device)
+        if inp.dtype == torch.float32:
+            kern = _ROW["kern"]["scatter_row_32b"]
+            S, B, O = src, inp, out
+        else:
+            kern = _ROW["kern"]["scatter_row_16b"]
+            S, B, O = (
+                src.view(torch.int16),
+                inp.view(torch.int16),
+                out.view(torch.int16),
+            )
+        with torch_device_fn.device(inp.device):
+            kern[(_ROW_GRID,)](
+                meta, index.view(-1), S.view(-1), B.view(-1), O.view(-1)
+            )
+        return out
+    except Exception as _e:  # pragma: no cover - never break correctness
+        logger.debug("GEMS_KUNLUNXIN SCATTER row path deferred: %r", _e)
+        return None
+
+
 def scatter(inp, dim, index, src, reduce=None):
     logger.debug("GEMS_KUNLUNXIN SCATTER")
     if dim < 0:
@@ -633,6 +781,11 @@ def scatter(inp, dim, index, src, reduce=None):
         ), "Unsupported operation: reduce scatter bfloat tensors."
 
     if reduce is None:
+        # Wide innermost rows go to the row-resident SM payload first (the LM
+        # path would emit one 2-byte DMA per scrambled element there).
+        res = _row_scatter_src(inp, dim, index, src)
+        if res is not None:
+            return res
         # The TLE LM-staging path allocates its own output and, when the index
         # covers every output row, skips the clone entirely (see
         # _tle_scatter_src).  Returns None -> defer to the codegen kernel.
@@ -683,6 +836,21 @@ def scatter_(inp, dim, index, src, reduce=None):
     assert (
         has_internal_overlapping(out) != MemOverlap.Yes
     ), "Unsupported operation: trying to inplace write to an internally overlapping tensor."
+
+    if reduce is None:
+        # Wide innermost rows: row-resident SM payload writes inp directly (its
+        # row load and its write-back are the same buffer), so no copy is paid.
+        res = _row_scatter_src(inp, dim, index, src, out=inp)
+        if res is not None:
+            return inp
+        # Reuse the innermost-dim tle.raw fast path and copy the result back.
+        # The payload reads each row's initial values from `base` before writing
+        # `out`; passing out=base=inp would alias those two roles, so keep them
+        # separate and pay one copy instead.
+        res = _tle_scatter_src(inp, dim, index, src)
+        if res is not None:
+            inp.copy_(res)
+            return inp
 
     src_restrided = src.as_strided(index.shape, src.stride())
     inp_restrided = restride_dim(inp, dim, index.shape)
