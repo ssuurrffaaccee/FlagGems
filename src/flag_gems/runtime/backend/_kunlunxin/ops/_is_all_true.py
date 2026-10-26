@@ -12,6 +12,71 @@ from ..utils.block_size_utils import get_block_size_1d
 
 logger = logging.getLogger(__name__)
 
+# ---- tle.raw payload: one cluster, prefix early-exit + cluster-SM reduce ----
+#
+# The Triton word path reads the whole tensor (16.8M bool -> 4.19M int32) and
+# pays a per-program AND-reduce; torch._is_all_true instead breaks at the first
+# False, so random data costs ~9us regardless of size. The payload does the same
+# early exit: 64 cores of one cluster each scan a contiguous slice, stop at the
+# first zero byte, publish one flag into `__shared__`, and core 0 folds the 64
+# flags and writes the 0-dim result. No mid buffer, no stage-2 reduce, no host
+# sync. Measured on card 3, 16.8M random: 28.9us -> 7.0us (torch 9.0us, 1.29x).
+# All-True / sparse-False data still scans (the early exit cannot fire), so the
+# old word path remains the fallback for small inputs and the payload is gated
+# at >= 1M elements (below that the launch floor dominates).
+_IAT_PAYLOAD_MIN_NUMEL = 1 << 20
+_IAT_PAYLOAD = {"init": False, "ok": False, "kern": None}
+
+
+def _iat_payload_init():
+    if _IAT_PAYLOAD["init"]:
+        return _IAT_PAYLOAD["ok"]
+    _IAT_PAYLOAD["init"] = True
+    try:
+        import os
+
+        import triton as _triton
+        import triton.experimental.tle as _tle
+
+        obj = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "payload",
+            "obj",
+            "iat_sm.o",
+        )
+        ns = {"_tle": _tle, "_OBJ": obj}
+        exec(
+            "@_tle.raw.dialect('xpu3', object=_OBJ, arch=3)\n"
+            "def iat_scan(n, x, out):\n"
+            "    ...\n",
+            ns,
+        )
+        callee = ns["iat_scan"]
+
+        def _mk(callee=callee):
+            @_triton.jit
+            def _k(N, X, OUT):
+                _tle.raw.call(callee, (N, X, OUT))
+
+            return _k
+
+        _IAT_PAYLOAD["kern"] = _mk()
+        _IAT_PAYLOAD["ok"] = True
+    except Exception as _e:  # pragma: no cover - keep backend importable
+        logger.debug("GEMS_KUNLUNXIN is_all_true payload init failed: %r", _e)
+        _IAT_PAYLOAD["ok"] = False
+    return _IAT_PAYLOAD["ok"]
+
+
+def _iat_payload_launch(inp):
+    if not _iat_payload_init():
+        return None
+    out = torch.empty((), dtype=torch.bool, device=inp.device)
+    with torch_device_fn.device(inp.device):
+        _IAT_PAYLOAD["kern"][(1,)](inp.numel(), inp.view(torch.int8), out)
+    return out
+
+
 _GLOBAL_2D_MIN = 1 << 23
 _TILE_BUDGET = 64 * 512
 
@@ -171,6 +236,11 @@ def _is_all_true(inp):
         with torch_device_fn.device(inp.device):
             is_all_true_empty_kernel[(1, 1, 1)](out, buffer_size_limit=2048)
         return out
+
+    if inp.is_contiguous() and n_elements >= _IAT_PAYLOAD_MIN_NUMEL:
+        out = _iat_payload_launch(inp)
+        if out is not None:
+            return out
 
     if inp.is_contiguous() and n_elements >= 4 and n_elements % 4 == 0:
         n_words = n_elements // 4
