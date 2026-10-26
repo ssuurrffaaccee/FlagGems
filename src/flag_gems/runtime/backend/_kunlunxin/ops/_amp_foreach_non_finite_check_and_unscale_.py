@@ -228,6 +228,83 @@ def _amp_foreach_found_inf_reduce_kernel(
     tl.store(found_inf_ptr, updated)
 
 
+# ---- tle.raw payload: SIMD check + scale, one flag per core -----------------
+#
+# The Triton kernel above pays two dtype round-trips (fp16 -> fp32 -> fp16, ~236us
+# per 25M elements) plus a 4096-lane `tl.max` flag reduction per program; the
+# payload works entirely in the tensor's own dtype with 32/16-lane SIMD:
+#   GM2LM 4KB chunk -> exponent-bit test (vvand/vvadd/vvor) -> vvmul by the
+#   broadcast inv_scale -> LM2GM, with one flag word per core.
+# Measured on card 3 (16.8M elements): fp16 1.056ms -> 86us, fp32 1.131ms -> 116us.
+# bf16 keeps the Triton path: there is no bf16 SIMD multiply, and the exponent
+# mask differs (8-bit), so a bf16 payload would need an fp32 unpack/repack.
+_AMP_PAYLOAD_MIN_NUMEL = 1 << 20
+_AMP_PAYLOAD_THREADS = 768  # 12 clusters x 64 cores, the geometry the payload assumes
+_AMP_PAYLOAD = {"init": False, "ok": False, "kern": {}}
+
+
+def _amp_payload_init():
+    if _AMP_PAYLOAD["init"]:
+        return _AMP_PAYLOAD["ok"]
+    _AMP_PAYLOAD["init"] = True
+    try:
+        import os
+
+        import triton as _triton
+        import triton.experimental.tle as _tle
+
+        obj = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "payload",
+            "obj",
+            "amp.o",
+        )
+        for sym in ("amp_16", "amp_32"):
+            ns = {"_tle": _tle, "_OBJ": obj}
+            exec(
+                "@_tle.raw.dialect('xpu3', object=_OBJ, arch=3)\n"
+                f"def {sym}(meta, x, scale, flags):\n"
+                "    ...\n",
+                ns,
+            )
+            callee = ns[sym]
+
+            def _mk(callee=callee):
+                @_triton.jit
+                def _k(M, X, S, F):
+                    _tle.raw.call(callee, (M, X, S, F))
+
+                return _k
+
+            _AMP_PAYLOAD["kern"][sym] = _mk()
+        _AMP_PAYLOAD["ok"] = True
+    except Exception as _e:  # pragma: no cover - keep backend importable
+        logger.debug("GEMS_KUNLUNXIN AMP payload init failed: %r", _e)
+        _AMP_PAYLOAD["ok"] = False
+    return _AMP_PAYLOAD["ok"]
+
+
+def _amp_payload_launch(tensor, inv_scale, flags, num_elements):
+    """True when the payload handled this tensor.
+
+    inv_scale stays on device: the payload reads it with one GM2LM and converts
+    it to the tensor's dtype itself, so there is no host round trip (a single
+    `.item()` here would cost ~60us, half the kernel).
+    """
+    if not _amp_payload_init():
+        return False
+    if tensor.dtype is torch.float32:
+        kern = _AMP_PAYLOAD["kern"]["amp_32"]
+        xv = tensor.view(torch.int32)
+        meta = torch.tensor([num_elements, 0], dtype=torch.int32, device=tensor.device)
+    else:
+        kern = _AMP_PAYLOAD["kern"]["amp_16"]
+        xv = tensor.view(torch.int16)
+        meta = torch.tensor([num_elements, 0], dtype=torch.int32, device=tensor.device)
+    kern[(12,)](meta, xv, inv_scale, flags)
+    return True
+
+
 def _amp_foreach_non_finite_check_and_unscale_(
     tensors: List[torch.Tensor],
     found_inf: torch.Tensor,
@@ -266,11 +343,19 @@ def _amp_foreach_non_finite_check_and_unscale_(
         if num_elements == 0:
             continue
 
+        use_payload = (
+            tensor.is_contiguous()
+            and tensor.dtype in (torch.float16, torch.float32)
+            and num_elements >= _AMP_PAYLOAD_MIN_NUMEL
+            and _amp_payload_init()
+        )
         block = (
             BLOCK_SIZE_LARGE if num_elements >= LARGE_TENSOR_NUMEL else BLOCK_SIZE_SMALL
         )
-        num_programs = triton.cdiv(num_elements, block)
-        jobs.append((tensor, num_elements, num_programs, block))
+        num_programs = (
+            _AMP_PAYLOAD_THREADS if use_payload else triton.cdiv(num_elements, block)
+        )
+        jobs.append((tensor, num_elements, num_programs, block, use_payload))
 
     if not jobs:
         return
@@ -281,8 +366,14 @@ def _amp_foreach_non_finite_check_and_unscale_(
     bad_flags = torch.empty(total_programs, dtype=torch.int32, device=inv_scale.device)
 
     flag_offset = 0
-    for tensor, num_elements, num_programs, block in jobs:
+    for tensor, num_elements, num_programs, block, use_payload in jobs:
         grid = (num_programs,)
+
+        if use_payload and _amp_payload_launch(
+            tensor, inv_scale, bad_flags[flag_offset:], num_elements
+        ):
+            flag_offset += num_programs
+            continue
 
         if tensor.is_contiguous():
             # Fast path: the store target aliases the load source, which is
