@@ -1,4 +1,5 @@
 import logging
+import os
 
 import torch
 import triton
@@ -7,6 +8,95 @@ import triton.language as tl
 from flag_gems.runtime import torch_device_fn
 
 logger = logging.getLogger(__name__)
+
+# ---- tle.raw payload: K output rows per block, 2 DMA per interior block ----
+# The vendor 7-segment path copies short output rows (68-260 elements =
+# 136-520 B) one segment at a time, measured ~60 GB/s. The payload stages K
+# rows with one bulk GM2LM, replicates the W edges in LM, and writes them back
+# with one bulk LM2GM (the reflection_pad2d recipe). D padding is a plane clamp.
+_RP3_PAYLOAD_MIN_ELEMS = 500_000
+_RP3_PAYLOAD_GRID = 12  # physical clusters
+_RP3_PAYLOAD = {"init": False, "ok": False, "kern": {}}
+_RP3_META_CACHE = {}
+
+
+def _rp3_payload_init():
+    if _RP3_PAYLOAD["init"]:
+        return _RP3_PAYLOAD["ok"]
+    _RP3_PAYLOAD["init"] = True
+    try:
+        import triton as _triton
+        import triton.experimental.tle as _tle
+
+        obj = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "payload",
+            "obj",
+            "replication_pad3d.o",
+        )
+        # C signature: (int* meta, T* in, T* out), meta =
+        # [nc, d_in, h_in, w_in, d_out, h_out, w_out, pad_f, pad_t, pad_l].
+        for sym in ("replication_pad3d_16", "replication_pad3d_32"):
+            ns = {"_tle": _tle, "_OBJ": obj}
+            exec(
+                "@_tle.raw.dialect('xpu3', object=_OBJ, arch=3)\n"
+                f"def {sym}(meta, x, out):\n"
+                "    ...\n",
+                ns,
+            )
+            callee = ns[sym]
+
+            def _mk(callee=callee):
+                @_triton.jit
+                def _k(M, X, O):
+                    _tle.raw.call(callee, (M, X, O))
+
+                return _k
+
+            _RP3_PAYLOAD["kern"][sym] = _mk()
+        _RP3_PAYLOAD["ok"] = True
+    except Exception as _e:  # pragma: no cover - keep backend importable
+        logger.debug("GEMS_KUNLUNXIN REPLICATION_PAD3D payload init failed: %r", _e)
+        _RP3_PAYLOAD["ok"] = False
+    return _RP3_PAYLOAD["ok"]
+
+
+def _rp3_payload_launch(
+    x, out, nc, d_in, h_in, w_in, d_out, h_out, w_out, pad_f, pad_t, pad_l
+):
+    if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return False
+    # __local__ row-buffer sizes baked into the packed payload.
+    if w_out > (1024 if x.dtype == torch.float32 else 2048):
+        return False
+    if not _rp3_payload_init():
+        return False
+    # Cache the tiny meta tensor: the benchmark calls the op many times with the
+    # same shape/pads, and a fresh 10-int H2D costs more than the small-shape
+    # kernel itself.
+    key = (
+        nc, d_in, h_in, w_in, d_out, h_out, w_out,
+        pad_f, pad_t, pad_l, x.device.index,
+    )
+    meta = _RP3_META_CACHE.get(key)
+    if meta is None:
+        meta = torch.tensor(
+            [nc, d_in, h_in, w_in, d_out, h_out, w_out, pad_f, pad_t, pad_l],
+            dtype=torch.int32,
+            device=x.device,
+        )
+        if len(_RP3_META_CACHE) >= 64:
+            _RP3_META_CACHE.clear()
+        _RP3_META_CACHE[key] = meta
+    if x.dtype == torch.float32:
+        kern = _RP3_PAYLOAD["kern"]["replication_pad3d_32"]
+        xi, oi = x, out
+    else:
+        kern = _RP3_PAYLOAD["kern"]["replication_pad3d_16"]
+        xi, oi = x.view(torch.int16), out.view(torch.int16)
+    with torch_device_fn.device(x.device):
+        kern[(_RP3_PAYLOAD_GRID,)](meta, xi.view(-1), oi.view(-1))
+    return True
 
 
 # Kunlunxin (XPU) override of replication_pad3d.
@@ -137,6 +227,16 @@ def replication_pad3d(x, padding):
                 BLOCK=BLOCK,
             )
         return out.squeeze(0) if is_4d else out
+
+    if total_out >= _RP3_PAYLOAD_MIN_ELEMS:
+        try:
+            if _rp3_payload_launch(
+                x, out, N * C, D_in, H_in, W_in, D_out, H_out, W_out,
+                pad_f, pad_t, pad_l,
+            ):
+                return out.squeeze(0) if is_4d else out
+        except Exception as exc:  # pragma: no cover - fall back on payload failure
+            logger.debug("replication_pad3d payload failed: %s", exc)
 
     # Fast path: 7 vendor strided-copy segments (interior + 6 expansion edges).
     with torch_device_fn.device(x.device):
