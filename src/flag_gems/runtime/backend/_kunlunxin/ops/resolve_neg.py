@@ -29,6 +29,7 @@
 # discrete path ([4096,4096] 48.9ms -> 0.34ms). Anything else falls back to
 # neg_func (correctness preserved).
 import logging
+import os
 
 import torch
 import triton
@@ -38,6 +39,65 @@ from flag_gems.ops.neg import neg_func
 from flag_gems.runtime import torch_device_fn
 
 logger = logging.getLogger(__name__)
+
+# ---- tle.raw payload: bulk 2N read + LM odd-lane compaction -----------------
+# The stride-2 Triton path fetches full cache lines anyway (2x traffic) but
+# issues a strided load per lane. The payload bulk-DMAs the contiguous complex
+# storage, compacts the odd lanes in LM while negating, and bulk-DMAs N floats.
+_RN_PAYLOAD_MIN_ELEMS = 500_000
+_RN_PAYLOAD_GRID = 12
+_RN_PAYLOAD = {"init": False, "ok": False, "kern": None}
+_RN_META_CACHE = {}
+
+
+def _rn_payload_init():
+    if _RN_PAYLOAD["init"]:
+        return _RN_PAYLOAD["ok"]
+    _RN_PAYLOAD["init"] = True
+    try:
+        import triton as _triton
+        import triton.experimental.tle as _tle
+
+        obj = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "payload",
+            "obj",
+            "resolve_neg.o",
+        )
+        ns = {"_tle": _tle, "_OBJ": obj}
+        exec(
+            "@_tle.raw.dialect('xpu3', object=_OBJ, arch=3)\n"
+            "def resolve_neg_lm(meta, fin, fout):\n"
+            "    ...\n",
+            ns,
+        )
+        callee = ns["resolve_neg_lm"]
+
+        @_triton.jit
+        def _k(M, I, O):
+            _tle.raw.call(callee, (M, I, O))
+
+        _RN_PAYLOAD["kern"] = _k
+        _RN_PAYLOAD["ok"] = True
+    except Exception as _e:  # pragma: no cover - keep backend importable
+        logger.debug("GEMS_KUNLUNXIN RESOLVE_NEG payload init failed: %r", _e)
+        _RN_PAYLOAD["ok"] = False
+    return _RN_PAYLOAD["ok"]
+
+
+def _rn_payload_launch(fin, fout, n, so):
+    if not _rn_payload_init():
+        return False
+    key = (n, so, fin.device.index)
+    meta = _RN_META_CACHE.get(key)
+    if meta is None:
+        meta = torch.tensor([n, so], dtype=torch.int32, device=fin.device)
+        if len(_RN_META_CACHE) >= 64:
+            _RN_META_CACHE.clear()
+        _RN_META_CACHE[key] = meta
+    with torch_device_fn.device(fin.device):
+        _RN_PAYLOAD["kern"][(_RN_PAYLOAD_GRID,)](meta, fin, fout)
+    return True
 
 
 @triton.jit
@@ -77,6 +137,12 @@ def resolve_neg(A: torch.Tensor):
     fin.set_(A.untyped_storage(), 0, (total,), (1,))
     out = torch.empty(A.shape, dtype=torch.float32, device=A.device)
     fout = out.reshape(-1)
+    if N >= _RN_PAYLOAD_MIN_ELEMS:
+        try:
+            if _rn_payload_launch(fin, fout, N, A.storage_offset()):
+                return out
+        except Exception as exc:  # pragma: no cover - fall back on failure
+            logger.debug("resolve_neg payload failed: %s", exc)
     BLOCK = 4096
     grid = (triton.cdiv(N, BLOCK),)
     with torch_device_fn.device(A.device):
