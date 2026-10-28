@@ -14,11 +14,15 @@
 
 import logging
 
+import os
+import struct
+
 import torch
 import triton
 import triton.language as tl
 
 from flag_gems import runtime
+from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
@@ -294,8 +298,134 @@ def _index_add_segments(index, block_s, block_c):
     return v_pad, perm_pad, head_pad, len_pad, U, int(lens.max().item())
 
 
+# ---- tle.raw payload: one core per row, LM-resident scatter-add -------------
+# Small/medium 2-D dim=1 rows fit one row in the per-core LM (16-bit <= 1280
+# elems, 32-bit <= 1024). One core owns a whole row, so duplicate indices
+# accumulate exactly without atomics or the uniqueness gate, and the host
+# bound-check/gate syncs are skipped. Larger rows keep the existing kernels.
+_IA_PAYLOAD_GRID = 12  # physical clusters
+_IA_PAYLOAD = {"init": False, "ok": False, "kern": {}}
+_IA_META_CACHE = {}
+
+
+def _ia_payload_init():
+    if _IA_PAYLOAD["init"]:
+        return _IA_PAYLOAD["ok"]
+    _IA_PAYLOAD["init"] = True
+    try:
+        import triton as _triton
+        import triton.experimental.tle as _tle
+
+        obj = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "payload",
+            "obj",
+            "index_add_lm.o",
+        )
+        # C signature: (int* meta, long long* idx, T* src, T* out);
+        # meta = [rows, w_out, w_idx, alpha_bits, is_bf16].
+        for sym in (
+            "index_add_lm_16",
+            "index_add_lm_32",
+            "index_add_row_16",
+            "index_add_row_32",
+            "index_add_rowb_16",
+            "index_add_rowb_32",
+        ):
+            ns = {"_tle": _tle, "_OBJ": obj}
+            exec(
+                "@_tle.raw.dialect('xpu3', object=_OBJ, arch=3)\n"
+                f"def {sym}(meta, idx, src, base, out):\n"
+                "    ...\n",
+                ns,
+            )
+            callee = ns[sym]
+
+            def _mk(callee=callee):
+                @_triton.jit
+                def _k(M, I, S, B, O):
+                    _tle.raw.call(callee, (M, I, S, B, O))
+
+                return _k
+
+            _IA_PAYLOAD["kern"][sym] = _mk()
+        _IA_PAYLOAD["ok"] = True
+    except Exception as _e:  # pragma: no cover - keep backend importable
+        logger.debug("GEMS_KUNLUNXIN INDEX_ADD payload init failed: %r", _e)
+        _IA_PAYLOAD["ok"] = False
+    return _IA_PAYLOAD["ok"]
+
+
+def _ia_payload_launch(inp, dim, index, src, alpha):
+    """Return the result tensor, or None to use the existing path."""
+    if not _IA_PAYLOAD["init"] and not _ia_payload_init():
+        return None
+    if inp.dim() != 2 or (int(dim) % 2) != 1:
+        return None
+    if inp.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return None
+    if index.dtype != torch.int64:
+        return None
+    if not (inp.is_contiguous() and index.is_contiguous() and src.is_contiguous()):
+        return None
+    rows, w_out = int(inp.shape[0]), int(inp.shape[1])
+    w_idx = int(index.numel())
+    if index.dim() != 1 or tuple(src.shape) != (rows, w_idx):
+        return None
+    if rows <= 0 or w_idx <= 0 or w_out <= 0:
+        return None
+    is32 = inp.dtype == torch.float32
+    lm_limit = 1024 if is32 else 1280
+    sm_limit = 65536 if is32 else 131072
+    batch = 1
+    if w_out <= lm_limit:
+        mode = "lm"
+    elif w_out <= sm_limit:
+        # The 64 cores of a cluster split the row's j range; duplicate indices
+        # would race, so the cluster path is gated on uniqueness (the gate is
+        # negligible at these row widths). Duplicates fall back to the segment
+        # kernel, which is deterministic.
+        if not _index_unique_gate(index, w_out):
+            return None
+        mode = "rowb"
+        # B rows per sync epoch: the rows must fit the cluster SM together.
+        batch = max(1, min(16, sm_limit // w_out))
+    else:
+        return None
+    if rows * w_out >= 2**31 or rows * w_idx >= 2**31:
+        return None
+    is_bf16 = 1 if inp.dtype == torch.bfloat16 else 0
+    alpha_bits = struct.unpack("<i", struct.pack("<f", float(alpha)))[0]
+    key = (rows, w_out, w_idx, alpha_bits, is_bf16, batch, inp.device.index)
+    meta = _IA_META_CACHE.get(key)
+    if meta is None:
+        meta = torch.tensor(
+            [rows, w_out, w_idx, alpha_bits, is_bf16, batch],
+            dtype=torch.int32,
+            device=inp.device,
+        )
+        if len(_IA_META_CACHE) >= 64:
+            _IA_META_CACHE.clear()
+        _IA_META_CACHE[key] = meta
+    out = torch.empty_like(inp)
+    sym = f"index_add_{mode}_{'32' if is32 else '16'}"
+    kern = _IA_PAYLOAD["kern"][sym]
+    if is32:
+        sv, bv, ov = src.view(-1), inp.view(-1), out.view(-1)
+    else:
+        sv = src.view(torch.int16).view(-1)
+        bv = inp.view(torch.int16).view(-1)
+        ov = out.view(torch.int16).view(-1)
+    with torch_device_fn.device(inp.device):
+        kern[(_IA_PAYLOAD_GRID,)](meta, index.view(-1), sv, bv, ov)
+    return out
+
+
 def index_add(inp, dim, index, src, alpha=1):
     logger.debug("GEMS_KUNLUNXIN INDEX_ADD")
+    _payload_out = _ia_payload_launch(inp, dim, index, src, alpha)
+    if _payload_out is not None:
+        return _payload_out
     # Cheap host-side bound check. A full tensor compare against a freshly
     # allocated ones(...) tensor (the previous form) was measured at ~5ms per
     # call on XPU (cross-device compare + allocation + sync), i.e. the single
