@@ -20,6 +20,7 @@ import triton
 import triton.language as tl
 
 from flag_gems import runtime
+from flag_gems.runtime import torch_device_fn
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +194,87 @@ def _row_scan(
         tl.store(o_base + c * STEP_OUT, v * dx, mask=m)
 
 
+_CT_PAYLOAD_GRID = 12  # physical clusters
+_CT_PAYLOAD = {"init": False, "ok": False, "kern": {}}
+_CT_META_CACHE = {}
+
+
+def _ct_payload_init():
+    if _CT_PAYLOAD["init"]:
+        return _CT_PAYLOAD["ok"]
+    _CT_PAYLOAD["init"] = True
+    try:
+        import os
+        import triton as _triton
+        import triton.experimental.tle as _tle
+
+        obj = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "runtime",
+            "backend",
+            "_kunlunxin",
+            "payload",
+            "obj",
+            "cumtrapz.o",
+        )
+        for sym in ("cumtrapz_16", "cumtrapz_bf16", "cumtrapz_32"):
+            ns = {"_tle": _tle, "_OBJ": obj}
+            exec(
+                "@_tle.raw.dialect('xpu3', object=_OBJ, arch=3)\n"
+                f"def {sym}(meta, y, out):\n"
+                "    ...\n",
+                ns,
+            )
+            callee = ns[sym]
+
+            def _mk(callee=callee):
+                @_triton.jit
+                def _k(M_, Y, O):
+                    _tle.raw.call(callee, (M_, Y, O))
+
+                return _k
+
+            _CT_PAYLOAD["kern"][sym] = _mk()
+        _CT_PAYLOAD["ok"] = True
+    except Exception as _e:  # pragma: no cover - keep backend importable
+        logger.debug("GEMS CUMPTRAPZ payload init failed: %r", _e)
+        _CT_PAYLOAD["ok"] = False
+    return _CT_PAYLOAD["ok"]
+
+
+def _ct_payload_launch(y, out, rows, N, dx):
+    """True when the payload handled the op."""
+    if N < 2 or rows <= 0:
+        return False
+    if not _ct_payload_init():
+        return False
+    import struct
+
+    key = (rows, N, float(dx), y.device.index)
+    meta = _CT_META_CACHE.get(key)
+    if meta is None:
+        meta = torch.tensor(
+            [rows, N, struct.unpack("<i", struct.pack("<f", float(dx)))[0]],
+            dtype=torch.int32,
+            device=y.device,
+        )
+        if len(_CT_META_CACHE) >= 64:
+            _CT_META_CACHE.clear()
+        _CT_META_CACHE[key] = meta
+    if y.dtype == torch.float32:
+        sym, yi, oi = "cumtrapz_32", y, out
+    elif y.dtype == torch.float16:
+        sym, yi, oi = "cumtrapz_16", y.view(torch.int16), out.view(torch.int16)
+    elif y.dtype == torch.bfloat16:
+        sym, yi, oi = "cumtrapz_bf16", y.view(torch.int16), out.view(torch.int16)
+    else:
+        return False
+    kern = _CT_PAYLOAD["kern"][sym]
+    with torch_device_fn.device(y.device):
+        kern[(_CT_PAYLOAD_GRID,)](meta, yi.view(-1), oi.view(-1))
+    return True
+
+
 @triton.jit
 def _cumtrapz_serial_kernel(
     y_ptr,
@@ -259,6 +341,13 @@ def cumulative_trapezoid(y, *, dx=1, dim=-1):
         inner = 1
         for s in shape[d + 1 :]:
             inner *= s
+        # tle.raw payload: one core per row, LM-resident sequential fp32 scan.
+        # It reproduces the reference's summation order, which the Triton tree
+        # scan cannot (2.6e-6 vs the 1.3e-6 tolerance on the largest shape).
+        if inner == 1 and y.is_contiguous() and D > 1:
+            if _ct_payload_launch(y, out, outer, D, float(dx)):
+                return out
+
         _cumtrapz_serial_kernel[(outer * inner,)](
             y.contiguous(),
             out,
