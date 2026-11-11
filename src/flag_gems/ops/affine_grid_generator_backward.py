@@ -23,6 +23,82 @@ logger = logging.getLogger(__name__)
 
 
 @triton.jit
+def _agb2d_partial_kernel(
+    g_ptr,
+    part_ptr,
+    hw,
+    W,
+    H,
+    T,
+    align_corners: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """One program per (batch, tile of H*W grid points).
+
+    The shipped kernels launch one program per batch element (grid=(N,)) and
+    walk H sequentially, so an N=2 case keeps 2 cores busy.  Here the point
+    list of each batch is tiled over (N, cdiv(H*W, BLOCK)) programs and every
+    point is handled by flat, vectorized loads: grad_output is [N, H, W, 2],
+    so one point is two contiguous floats.  Six partial sums per tile are
+    written out and reduced by ``_agb2d_reduce_kernel``.
+    """
+    b = tl.program_id(0)
+    t = tl.program_id(1)
+    idx = t * BLOCK + tl.arange(0, BLOCK)
+    m = idx < hw
+    base = b * (hw * 2) + idx * 2
+    g0 = tl.load(g_ptr + base, mask=m, other=0.0).to(tl.float32)
+    g1 = tl.load(g_ptr + base + 1, mask=m, other=0.0).to(tl.float32)
+
+    wf = (idx % W).to(tl.float32)
+    hf = (idx // W).to(tl.float32)
+    if align_corners:
+        x = tl.where(W > 1, 2.0 * wf / (W - 1) - 1.0, 0.0)
+        y = tl.where(H > 1, 2.0 * hf / (H - 1) - 1.0, 0.0)
+    else:
+        x = (2.0 * wf + 1.0) / W - 1.0
+        y = (2.0 * hf + 1.0) / H - 1.0
+
+    z = tl.zeros((BLOCK,), dtype=tl.float32)
+    out = part_ptr + (b * T + t) * 6
+    tl.store(out + 0, tl.sum(tl.where(m, g0 * x, z)))
+    tl.store(out + 1, tl.sum(tl.where(m, g0 * y, z)))
+    tl.store(out + 2, tl.sum(tl.where(m, g0, z)))
+    tl.store(out + 3, tl.sum(tl.where(m, g1 * x, z)))
+    tl.store(out + 4, tl.sum(tl.where(m, g1 * y, z)))
+    tl.store(out + 5, tl.sum(tl.where(m, g1, z)))
+
+
+@triton.jit
+def _agb2d_reduce_kernel(
+    part_ptr,
+    out_ptr,
+    T,
+    TT6: tl.constexpr,
+):
+    """One program per batch: sum the per-tile partials into grad_theta.
+
+    The partials of one batch are a contiguous run of ``T*6`` floats, so they
+    are loaded as one vector and de-interleaved by lane index.  (A scalar loop
+    costs ~0.6us per GM load on XPU, and the 2-D tile form tripped an LLVM
+    lowering bug for some tile counts.)
+    """
+    b = tl.program_id(0)
+    n = T * 6
+    k = tl.arange(0, TT6)
+    v = tl.load(part_ptr + b * n + k, mask=k < n, other=0.0)
+    lane = k % 6
+    z = tl.zeros((TT6,), dtype=tl.float32)
+    o = out_ptr + b * 6
+    tl.store(o + 0, tl.sum(tl.where(lane == 0, v, z)))
+    tl.store(o + 1, tl.sum(tl.where(lane == 1, v, z)))
+    tl.store(o + 2, tl.sum(tl.where(lane == 2, v, z)))
+    tl.store(o + 3, tl.sum(tl.where(lane == 3, v, z)))
+    tl.store(o + 4, tl.sum(tl.where(lane == 4, v, z)))
+    tl.store(o + 5, tl.sum(tl.where(lane == 5, v, z)))
+
+
+@triton.jit
 def _affine_grid_generator_backward_2d_kernel(
     grad_output_ptr,
     grad_theta_ptr,
@@ -385,9 +461,35 @@ def affine_grid_generator_backward(grad_output, size, align_corners):
         if BLOCK_W < 32:
             BLOCK_W = 32
 
-        # Use per-element parallelism when N is small and HW is large
-        # This gives better GPU utilization for cases like N=1, H=1024, W=1024
-        if N <= 4 and H * W > 4096:
+        # Tile the per-batch point list over (N, cdiv(H*W, BLOCK)) programs:
+        # the shipped kernels launch one program per batch (or N*6) and leave
+        # most of the machine idle for the N <= 32 cases measured here.
+        if grad_output.dtype != torch.float64:
+            hw = H * W
+            block = 4096
+            t_tiles = (hw + block - 1) // block
+            part = torch.empty(
+                N * t_tiles * 6, device=grad_output.device, dtype=torch.float32
+            )
+            _agb2d_partial_kernel[(N, t_tiles)](
+                grad_output,
+                part,
+                hw,
+                W,
+                H,
+                t_tiles,
+                align_corners,
+                BLOCK=block,
+                num_warps=4,
+            )
+            _agb2d_reduce_kernel[(N,)](
+                part,
+                grad_theta,
+                t_tiles,
+                TT6=triton.next_power_of_2(t_tiles * 6),
+                num_warps=1,
+            )
+        elif N <= 4 and H * W > 4096:
             grid = (N * 6,)
             _affine_grid_backward_2d_per_elem_kernel[grid](
                 grad_output,
