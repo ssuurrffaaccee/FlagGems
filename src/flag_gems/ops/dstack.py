@@ -49,6 +49,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.runtime import torch_device_fn
+
 logger = logging.getLogger(__name__)
 
 _BLOCK_WIDE = 1024
@@ -106,6 +108,166 @@ def _dstack_copy_kernel(
     o = g // s
     t = g - o * s
     tl.store(out_ptr + o * row + off + t, tl.load(in_ptr + g, mask=mask), mask=mask)
+
+
+def _copy_block(seg):
+    """Largest power-of-two tile that divides ``seg`` (0 when there is none).
+
+    The row-copy kernel has no tail path on purpose: an in-kernel `if` around the
+    masked store trips the backend's dominance verifier, and masking every tile
+    is what made the old kernel slow.  Rows whose length is not a power of two
+    multiple keep the flat kernel.
+    """
+    block = 1
+    while block * 2 <= _BLOCK_NARROW and seg % (block * 2) == 0:
+        block *= 2
+    return block if block >= 128 else 0
+
+
+_DS_GRID = 12  # physical clusters
+_DS_PAYLOAD = {"init": False, "ok": False, "kern": {}}
+_DS_META = {}
+_DS_C16 = 256  # input elements per LM chunk, 16-bit path
+_DS_C32 = 128  # ... 32-bit path
+
+
+def _mk_ds_run16(tle, callee):
+    @triton.jit
+    def _ds_k_run16(M, I, O):
+        tle.raw.call(callee, (M, I, O))
+
+    return _ds_k_run16
+
+
+def _mk_ds_run32(tle, callee):
+    @triton.jit
+    def _ds_k_run32(M, I, O):
+        tle.raw.call(callee, (M, I, O))
+
+    return _ds_k_run32
+
+
+def _mk_ds_ilv16(tle, callee):
+    @triton.jit
+    def _ds_k_ilv16(M, A, B, C, D, O):
+        tle.raw.call(callee, (M, A, B, C, D, O))
+
+    return _ds_k_ilv16
+
+
+def _mk_ds_ilv32(tle, callee):
+    @triton.jit
+    def _ds_k_ilv32(M, A, B, C, D, O):
+        tle.raw.call(callee, (M, A, B, C, D, O))
+
+    return _ds_k_ilv32
+
+
+_DS_MAKERS = {
+    "ds_run_16": _mk_ds_run16,
+    "ds_run_32": _mk_ds_run32,
+    "ds_ilv_16": _mk_ds_ilv16,
+    "ds_ilv_32": _mk_ds_ilv32,
+}
+
+
+def _ds_payload_init():
+    if _DS_PAYLOAD["init"]:
+        return _DS_PAYLOAD["ok"]
+    _DS_PAYLOAD["init"] = True
+    try:
+        import os
+
+        import triton as _triton
+        import triton.experimental.tle as _tle
+
+        obj = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "runtime",
+            "backend",
+            "_kunlunxin",
+            "payload",
+            "obj",
+            "ds.o",
+        )
+        for sym in _DS_MAKERS:
+            ns = {"_tle": _tle, "_OBJ": obj}
+            if sym.startswith("ds_ilv"):
+                sig = "(meta, a, b, c, d, out)"
+            else:
+                sig = "(meta, inp, out)"
+            exec(
+                "@_tle.raw.dialect('xpu3', object=_OBJ, arch=3)\n"
+                f"def {sym}{sig}:\n"
+                "    ...\n",
+                ns,
+            )
+            _DS_PAYLOAD["kern"][sym] = _DS_MAKERS[sym](_tle, ns[sym])
+        _DS_PAYLOAD["ok"] = True
+    except Exception as _e:  # pragma: no cover - keep backend importable
+        logger.debug("GEMS DSTACK payload init failed: %r", _e)
+        _DS_PAYLOAD["ok"] = False
+    return _DS_PAYLOAD["ok"]
+
+
+def _ds_meta(key, values):
+    meta = _DS_META.get(key)
+    if meta is None:
+        meta = torch.tensor(values, dtype=torch.int32, device="cuda")
+        if len(_DS_META) >= 64:
+            _DS_META.clear()
+        _DS_META[key] = meta
+    return meta
+
+
+def _ds_unit(t):
+    return t.element_size()
+
+
+def _ds_run_copy(out_view, source, seg, out_off, out_row, outer, unit):
+    """Copy every row of ``source`` into its output slice with DMA chunks."""
+    chunk = 1024 if unit == 2 else 512
+    nchunk = (seg + chunk - 1) // chunk
+    meta = _ds_meta(("run", outer, seg, out_off, out_row, chunk),
+                    [outer, seg, out_off, out_row, chunk, nchunk])
+    sym = "ds_run_16" if unit == 2 else "ds_run_32"
+    kern = _DS_PAYLOAD["kern"][sym]
+    with torch_device_fn.device(out_view.device):
+        kern[(_DS_GRID,)](meta, source.view(-1), out_view.view(-1))
+
+
+def _ds_interleave(out_view, sources, n, p, unit):
+    """out[P*t + p] = sources[p][t] for the whole flat extent."""
+    C = _DS_C16 if unit == 2 else _DS_C32
+    step = 96 if unit == 2 else 48
+    steps = (p * C) // step
+    meta = _ds_meta(("ilv", n, p, unit), [n, C, steps, p])
+    sym = "ds_ilv_16" if unit == 2 else "ds_ilv_32"
+    kern = _DS_PAYLOAD["kern"][sym]
+    args = [src.view(-1) for src in sources]
+    while len(args) < 4:
+        args.append(args[-1])
+    with torch_device_fn.device(out_view.device):
+        kern[(_DS_GRID,)](meta, args[0], args[1], args[2], args[3],
+                          out_view.view(-1))
+
+
+@triton.jit
+def _dstack_copy_rows_kernel(
+    out_ptr, in_ptr, seg, out_off, out_row, BLOCK: tl.constexpr
+):
+    """Copy one contiguous chunk of one input row into its output slice.
+
+    Row ``o`` of an input is the contiguous run ``[o*seg, (o+1)*seg)`` and lands
+    on the contiguous run ``[o*out_row + out_off, +seg)`` of the output, so no
+    per-element index math and no mask is needed (``BLOCK`` divides ``seg``).
+    """
+    o = tl.program_id(0).to(tl.int64)
+    base = tl.program_id(1) * BLOCK
+    off = tl.arange(0, BLOCK).to(tl.int64)
+    src = in_ptr + o * seg + base + off
+    dst = out_ptr + o * out_row + out_off + base + off
+    tl.store(dst, tl.load(src))
 
 
 @triton.jit
@@ -228,6 +390,7 @@ def run(tensors, out=None, **kwargs):
 
     real_dtype = _real_dtype(result.dtype)
     unit = 1 if real_dtype is None else 2
+    unit_b = items[0].element_size()
     if result.numel() == 0:
         return result
 
@@ -244,6 +407,16 @@ def run(tensors, out=None, **kwargs):
         and real_dtype is None
         and all(item.dtype not in _MULTI_SELECT_UNSUPPORTED for item in items)
     ):
+        if (
+            unit_b in (2, 4)
+            and len(items) > 1
+            and all(it.dtype == result.dtype for it in items)
+            and _ds_payload_init()
+        ):
+            # out[P*t + p] = in_p[t] element-wise: DMA the P chunks into one LM
+            # buffer and let per-lane gathers build the interleaved stream.
+            _ds_interleave(out_view, items, outer, len(items), unit_b)
+            return result
         sources = [items[i] if i < len(items) else items[0] for i in range(_MAX_GROUP)]
         if outer >= _TOKEN_OB_CUTOFF:
             rp, ob, warps = _TOKEN_RP_LARGE, _TOKEN_OB_LARGE, _TOKEN_WARPS_LARGE
@@ -276,18 +449,41 @@ def run(tensors, out=None, **kwargs):
                 # Short rows (one slice per outer row) are bound by the number of
                 # live programs, so they take the wider block; longer runs were
                 # measured to prefer the smaller one.
-                block = _BLOCK_WIDE if seg <= 4 else _BLOCK_NARROW
-                grid = (triton.cdiv(count, block),)
-                _dstack_copy_kernel[grid](
-                    out_view,
-                    source,
-                    count,
-                    seg,
-                    out_row,
-                    offset * inner * unit,
-                    BLOCK=block,
-                    num_warps=_WARPS,
-                )
+                if (
+            unit_b in (2, 4)
+            and len(items) > 1
+            and all(it.dtype == result.dtype for it in items)
+            and _ds_payload_init()
+        ):
+                    _ds_run_copy(out_view, source, seg, offset * inner * unit,
+                                 out_row, outer, unit_b)
+                    offset += depth_i
+                    continue
+                block = _copy_block(seg)
+                if block:
+                    grid = (outer, seg // block)
+                    _dstack_copy_rows_kernel[grid](
+                        out_view,
+                        source,
+                        seg,
+                        offset * inner * unit,
+                        out_row,
+                        BLOCK=block,
+                        num_warps=_WARPS,
+                    )
+                else:
+                    block = _BLOCK_WIDE if seg <= 4 else _BLOCK_NARROW
+                    grid = (triton.cdiv(count, block),)
+                    _dstack_copy_kernel[grid](
+                        out_view,
+                        source,
+                        count,
+                        seg,
+                        out_row,
+                        offset * inner * unit,
+                        BLOCK=block,
+                        num_warps=_WARPS,
+                    )
         offset += depth_i
     return result
 
