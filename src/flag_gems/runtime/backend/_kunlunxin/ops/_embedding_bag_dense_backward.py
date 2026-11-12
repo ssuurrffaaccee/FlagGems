@@ -1,9 +1,12 @@
 import logging
+import os
 
 import torch
 import triton
 import triton.language as tl
+import triton.experimental.tle as tle
 
+from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
@@ -12,6 +15,104 @@ _ROWS_TILE = 128
 _SAMP_TILE = 128
 _RANK_TILE = 64
 _MAX_SCAN = 8192
+
+# ---------------------------------------------------------------------------
+# tle.raw payload: dense backward for mode=0, no per-sample weights, no
+# scale_grad_by_freq.  The benchmark workloads are tiny in NW and N, so rather
+# than a CSR + rank permutation we invert the loop: one core owns output rows,
+# scans all sample indices in 128-blocks and accumulates the few matching
+# grad[bag] rows in an fp32 LM accumulator.  This is O(NW*N) compares but they
+# are cached/vector-free scalar compares and only N grad rows are ever read.
+# ---------------------------------------------------------------------------
+_EB_OBJ = os.path.join(
+    os.path.dirname(__file__), "..", "payload", "obj", "embedding_bag.o"
+)
+_EB_GRID = 12
+_EB_DMAX = 256
+_EB_META = {}
+_HAS_EB_RAW = False
+try:
+
+    @tle.raw.dialect("xpu3", object=_EB_OBJ, arch=3)
+    def ebd_16(meta, grad, idx, o2b, out): ...
+
+    @tle.raw.dialect("xpu3", object=_EB_OBJ, arch=3)
+    def ebd_32(meta, grad, idx, o2b, out): ...
+
+    @tle.raw.dialect("xpu3", object=_EB_OBJ, arch=3)
+    def ebs_copy16(meta, grad, o2b, out): ...
+
+    @tle.raw.dialect("xpu3", object=_EB_OBJ, arch=3)
+    def ebs_copy32(meta, grad, o2b, out): ...
+
+    @triton.jit
+    def _ebd16_kernel(M, G, I, O2, O):
+        tle.raw.call(ebd_16, (M, G, I, O2, O))
+
+    @triton.jit
+    def _ebd32_kernel(M, G, I, O2, O):
+        tle.raw.call(ebd_32, (M, G, I, O2, O))
+
+    _HAS_EB_RAW = True
+except Exception:  # pragma: no cover - tle.raw object= unavailable
+    _HAS_EB_RAW = False
+
+
+def _eb_meta(nw, d, n, pad, device):
+    key = (int(nw), int(d), int(n), int(pad), str(device))
+    meta = _EB_META.get(key)
+    if meta is None:
+        if len(_EB_META) >= 64:
+            _EB_META.clear()
+        meta = torch.tensor([nw, d, n, pad], dtype=torch.int32, device=device)
+        _EB_META[key] = meta
+    return meta
+
+
+def _ebd_payload(grad, indices, offset2bag, num_weights, padding_idx):
+    if not _HAS_EB_RAW:
+        return None
+    if grad.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return None
+    nb, d = grad.shape
+    nw = int(num_weights)
+    n = indices.numel()
+    if nb <= 0 or nw <= 0 or d <= 0 or n <= 0 or d > _EB_DMAX:
+        return None
+    if nw * n > (1 << 26):
+        return None
+    if padding_idx < -1:
+        return None
+    pad = padding_idx if padding_idx is not None and padding_idx >= 0 else -1
+    idx32 = indices.to(torch.int32)
+    o2b32 = offset2bag.to(torch.int32)
+    if not idx32.is_contiguous():
+        idx32 = idx32.contiguous()
+    if not o2b32.is_contiguous():
+        o2b32 = o2b32.contiguous()
+    meta = _eb_meta(nw, d, n, pad, grad.device)
+    try:
+        with torch_device_fn.device(grad.device):
+            if grad.dtype == torch.float32:
+                out = torch.empty(nw, d, dtype=torch.float32, device=grad.device)
+                _ebd32_kernel[(_EB_GRID,)](meta, grad, idx32, o2b32, out)
+                return out
+            if grad.dtype == torch.bfloat16:
+                gf = grad.float()
+                out32 = torch.empty(nw, d, dtype=torch.float32, device=grad.device)
+                _ebd32_kernel[(_EB_GRID,)](meta, gf, idx32, o2b32, out32)
+                return out32.to(torch.bfloat16)
+            out = torch.empty(nw, d, dtype=torch.float16, device=grad.device)
+            _ebd16_kernel[(_EB_GRID,)](
+                meta,
+                grad.view(torch.int16),
+                idx32,
+                o2b32,
+                out.view(torch.int16),
+            )
+            return out
+    except Exception:
+        return None
 
 
 @libentry()
@@ -416,6 +517,11 @@ def _embedding_bag_dense_backward(
             per_sample_weights,
             padding_idx,
         )
+
+    if kind == "csr" and int(mode) == 0 and not scale_grad_by_freq and per_sample_weights is None:
+        out = _ebd_payload(grad, indices, offset2bag, int(num_weights), padding_idx)
+        if out is not None:
+            return out
 
     device = grad.device
     num_bags, dim = grad.shape
