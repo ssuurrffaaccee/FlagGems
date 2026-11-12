@@ -28,6 +28,9 @@ from ._embedding_bag_dense_backward import _embedding_bag_dense_backward
 from ._embedding_bag_per_sample_weights_backward import (  # noqa: F401
     _embedding_bag_per_sample_weights_backward,
 )
+from ._embedding_bag_sparse_backward import (  # noqa: F401
+    _embedding_bag_sparse_backward,
+)
 from ._euclidean_dist import _euclidean_dist
 from ._fake_quantize_per_tensor_affine_cachemask_tensor_qparams import (  # noqa: F401
     _fake_quantize_per_tensor_affine_cachemask_tensor_qparams,
