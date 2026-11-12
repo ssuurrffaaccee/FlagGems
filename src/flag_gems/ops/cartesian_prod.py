@@ -29,6 +29,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.runtime import torch_device_fn
+
 logger = logging.getLogger(__name__)
 
 _MAX_TENSORS = 8
@@ -204,6 +206,111 @@ def _plan(m, n):
     return _BLOCK_ROWS, _NUM_WARPS, False
 
 
+_CP_GRID = 12  # physical clusters
+_CP_PAYLOAD = {"init": False, "ok": False, "kern": {}}
+_CP_META = {}
+_CP_IN16 = 2048  # packed input elements that fit LM
+_CP_IN32 = 1024
+_CP_RB16 = 256  # output rows per LM block
+_CP_RB32 = 128
+
+
+def _mk_cp16(tle, callee):
+    @triton.jit
+    def _cp_k16(M, O, A, B, C, D):
+        tle.raw.call(callee, (M, O, A, B, C, D))
+
+    return _cp_k16
+
+
+def _mk_cp32(tle, callee):
+    @triton.jit
+    def _cp_k32(M, O, A, B, C, D):
+        tle.raw.call(callee, (M, O, A, B, C, D))
+
+    return _cp_k32
+
+
+def _cp_payload_init():
+    if _CP_PAYLOAD["init"]:
+        return _CP_PAYLOAD["ok"]
+    _CP_PAYLOAD["init"] = True
+    try:
+        import os
+
+        import triton.experimental.tle as _tle
+
+        obj = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "runtime",
+            "backend",
+            "_kunlunxin",
+            "payload",
+            "obj",
+            "cp.o",
+        )
+        for sym, maker in (("cp_16", _mk_cp16), ("cp_32", _mk_cp32)):
+            ns = {"_tle": _tle, "_OBJ": obj}
+            exec(
+                "@_tle.raw.dialect('xpu3', object=_OBJ, arch=3)\n"
+                f"def {sym}(meta, out, a, b, c, d):\n"
+                "    ...\n",
+                ns,
+            )
+            _CP_PAYLOAD["kern"][sym] = maker(_tle, ns[sym])
+        _CP_PAYLOAD["ok"] = True
+    except Exception as _e:  # pragma: no cover
+        logger.debug("GEMS CARTESIAN_PROD payload init failed: %r", _e)
+        _CP_PAYLOAD["ok"] = False
+    return _CP_PAYLOAD["ok"]
+
+
+def _cp_try(tensors, out):
+    """Fill ``out`` with the payload; False when this shape is not covered."""
+    n = len(tensors)
+    if n < 2 or n > 4 or not _cp_payload_init():
+        return False
+    unit = tensors[0].element_size()
+    if unit not in (2, 4):
+        return False
+    if any(t.dtype != tensors[0].dtype for t in tensors):
+        return False
+    if any(not t.is_contiguous() for t in tensors):
+        return False
+    sizes = [t.numel() for t in tensors]
+    cap = _CP_IN16 if unit == 2 else _CP_IN32
+    if sum(sizes) > cap:
+        return False
+    m = 1
+    for s in sizes:
+        m *= s
+    rb = _CP_RB16 if unit == 2 else _CP_RB32
+    prs = _suffix_products(sizes)
+    key = (m, n, unit, tuple(sizes))
+    meta = _CP_META.get(key)
+    if meta is None:
+        meta = torch.tensor(
+            [m, n, rb]
+            + sizes
+            + [0] * (4 - n)
+            + prs
+            + [0] * (4 - n),
+            dtype=torch.int32,
+            device=tensors[0].device,
+        )
+        if len(_CP_META) >= 64:
+            _CP_META.clear()
+        _CP_META[key] = meta
+    args = [t.view(-1) for t in tensors]
+    while len(args) < 4:
+        args.append(args[-1])
+    sym = "cp_16" if unit == 2 else "cp_32"
+    kern = _CP_PAYLOAD["kern"][sym]
+    with torch_device_fn.device(tensors[0].device):
+        kern[(_CP_GRID,)](meta, out.view(-1), args[0], args[1], args[2], args[3])
+    return True
+
+
 class _CartesianProd(torch.autograd.Function):
     @staticmethod
     def forward(ctx, n, sizes, *tensors):
@@ -214,6 +321,9 @@ class _CartesianProd(torch.autograd.Function):
             m *= s
         out = torch.empty((m, n), dtype=tensors[0].dtype, device=tensors[0].device)
         if m == 0:
+            return out
+
+        if _cp_try(tensors, out):
             return out
 
         pad = _MAX_TENSORS - n
